@@ -280,6 +280,8 @@ class FunctionDecoratorManager(DecoratorManager):
             for result_handler_dec in result_handlers:
                 await result_handler_dec.handle_call_result(data, result)
         except Exception as e:
+            for result_handler_dec in result_handlers:
+                await result_handler_dec.handle_call_exception(data, e)
             await self.handle_exception(e)
 
     async def dispatch(self, data: DispatchData) -> None:
@@ -290,6 +292,8 @@ class FunctionDecoratorManager(DecoratorManager):
         for dec in decorators:
             if await dec.handle_dispatch(data) is False:
                 self.logger.debug("Trigger not active due to %s", dec)
+                for result_handler_dec in self.get_decorators(CallResultHandlerDecorator):
+                    await result_handler_dec.handle_call_result(data, None)
                 return
 
         action_ast_ctx = AstEval(

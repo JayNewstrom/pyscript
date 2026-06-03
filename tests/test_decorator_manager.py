@@ -599,6 +599,30 @@ async def test_function_decorator_manager_logs_call_exception(hass):
     assert str(ast_ctx.logged_exceptions[0]) == "decorated call failed"
 
 
+@pytest.mark.asyncio
+async def test_function_decorator_manager_exception_calls_result_handlers(hass):
+    """When the decorated function raises, result handlers should be notified with None."""
+    DecoratorManager.hass = hass
+    ast_ctx = DummyAstCtx()
+    manager = FunctionDecoratorManager(ast_ctx, DummyEvalFuncVar())
+    result_handler = make_recording_result_handler()
+    manager.add(result_handler)
+    call_ast_ctx = DummyCallAstCtx(exc=RuntimeError("boom"))
+
+    with patch.object(Function, "store_hass_context"):
+        await call_function_manager(
+            manager,
+            make_dispatch_data(
+                {"arg1": 1},
+                call_ast_ctx=call_ast_ctx,
+                hass_context=Context(id="call-parent"),
+            ),
+        )
+
+    assert result_handler.results == [None]
+    assert len(ast_ctx.logged_exceptions) == 1
+
+
 def test_decorator_registry_register_requires_name():
     """Registry should reject decorators without a declared name."""
 

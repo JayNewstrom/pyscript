@@ -1,0 +1,175 @@
+"""Webhook handler decorator."""
+
+from __future__ import annotations
+
+import asyncio
+from http import HTTPStatus
+import logging
+from typing import Any, ClassVar
+
+from aiohttp import hdrs, web
+import voluptuous as vol
+
+from homeassistant.components import webhook
+from homeassistant.components.webhook import SUPPORTED_METHODS
+from homeassistant.helpers import config_validation as cv
+
+from ..decorator_abc import CallResultHandlerDecorator, DispatchData, TriggerDecorator
+from .base import AutoKwargsDecorator, ExpressionDecorator
+from .webhook import WebhookTriggerDecorator
+
+_LOGGER = logging.getLogger(__name__)
+
+# Key under which the per-request response future is stored on DispatchData.trigger_context.
+# Per-request state must live on DispatchData (one per request), not on the shared decorator
+# instance, so concurrent requests to the same webhook_id don't race over a single future.
+_RESPONSE_FUTURE_KEY = "webhook_response_future"
+
+
+class WebhookHandlerDecorator(
+    TriggerDecorator, ExpressionDecorator, AutoKwargsDecorator, CallResultHandlerDecorator
+):
+    """Implementation for @webhook_handler (one handler per id; return value drives the response)."""
+
+    name = "webhook_handler"
+    args_schema = vol.Schema(
+        vol.All(
+            [vol.Coerce(str)],
+            vol.Length(min=1, max=2, msg="needs at least one argument"),
+        )
+    )
+    kwargs_schema = vol.Schema(
+        {
+            vol.Optional("local_only", default=True): cv.boolean,
+            vol.Optional("methods"): vol.All(list[str], [vol.In(SUPPORTED_METHODS)]),
+        }
+    )
+
+    webhook_id: str
+    local_only: bool
+    methods: set[str]
+
+    # Exactly one handler per webhook_id (unlike webhook_trigger which allows many).
+    webhook_id2handler: ClassVar[dict[str, WebhookHandlerDecorator]] = {}
+
+    async def validate(self):
+        """Validate the webhook handler configuration."""
+        await super().validate()
+        self.webhook_id = self.args[0]
+
+        if len(self.args) == 2:
+            self.create_expression(self.args[1])
+
+    @staticmethod
+    async def _handler(hass, webhook_id, request):
+        handler = WebhookHandlerDecorator.webhook_id2handler.get(webhook_id)
+        if handler is None:
+            return None
+
+        func_args = {
+            "trigger_type": "webhook",
+            "webhook_id": webhook_id,
+            "request": request,
+        }
+
+        if "json" in request.headers.get(hdrs.CONTENT_TYPE, ""):
+            func_args["payload"] = await request.json()
+        else:
+            # Could potentially return multiples of a key - only take the first
+            payload_multidict = await request.post()
+            func_args["payload"] = {k: payload_multidict.getone(k) for k in payload_multidict.keys()}
+
+        if handler.has_expression():
+            if not await handler.check_expression_vars(func_args):
+                return None
+
+        response_future: asyncio.Future[Any] = hass.loop.create_future()
+        data = DispatchData(func_args, trigger_context={_RESPONSE_FUTURE_KEY: response_future})
+        await handler.dispatch(data)
+
+        result = await response_future
+        return WebhookHandlerDecorator.coerce_response(result)
+
+    async def handle_call_result(self, data: DispatchData, result: Any) -> None:
+        """Resolve the per-request response future with the function's return value."""
+        if data.trigger is not self:
+            return
+        response_future = data.trigger_context.get(_RESPONSE_FUTURE_KEY)
+        if response_future is not None and not response_future.done():
+            response_future.set_result(result)
+
+    async def handle_call_exception(self, data: DispatchData, exc: Exception) -> None:
+        """
+        Resolve the per-request response future with a 500 on an unhandled exception.
+
+        The exception is also logged via the manager's handle_exception; here we only
+        ensure the awaiting request gets a 500 instead of falling back to a 200. We
+        resolve with a Response (not set_exception) so the error does not propagate out
+        of the aiohttp handler, where Home Assistant would turn it back into a 200.
+        """
+        if data.trigger is not self:
+            return
+        response_future = data.trigger_context.get(_RESPONSE_FUTURE_KEY)
+        if response_future is not None and not response_future.done():
+            response_future.set_result(web.Response(status=HTTPStatus.INTERNAL_SERVER_ERROR))
+
+    @staticmethod
+    def coerce_response(value: Any) -> web.Response | None:
+        """Convert a webhook handler return value to an aiohttp Response."""
+        if value is None:
+            return None
+        if isinstance(value, web.Response):
+            return value
+        # bool is a subclass of int; reject it so True/False don't become 1/0 status codes.
+        if isinstance(value, int) and not isinstance(value, bool):
+            return web.Response(status=value)
+        _LOGGER.warning(
+            "@webhook_handler function returned unsupported type %s; "
+            "expected int status code or aiohttp.web.Response",
+            type(value).__name__,
+        )
+        return None
+
+    @staticmethod
+    def _add_handler(handler: WebhookHandlerDecorator) -> None:
+        webhook_id = handler.webhook_id
+        if webhook_id in WebhookHandlerDecorator.webhook_id2handler:
+            raise ValueError(
+                f"webhook_id '{webhook_id}' already has a @webhook_handler; only one is allowed"
+            )
+        if webhook_id in WebhookTriggerDecorator.webhook_id2triggers:
+            raise ValueError(
+                f"webhook_id '{webhook_id}' is already used by a @webhook_trigger; "
+                f"a @webhook_handler must use a unique webhook_id"
+            )
+
+        webhook.async_register(
+            handler.dm.hass,
+            "pyscript",  # DOMAIN
+            "pyscript",  # NAME
+            webhook_id,
+            WebhookHandlerDecorator._handler,
+            local_only=handler.local_only,
+            allowed_methods=handler.methods,
+        )
+        WebhookHandlerDecorator.webhook_id2handler[webhook_id] = handler
+
+    @staticmethod
+    def _remove_handler(handler: WebhookHandlerDecorator) -> None:
+        webhook_id = handler.webhook_id
+        if WebhookHandlerDecorator.webhook_id2handler.get(webhook_id) is not handler:
+            return
+        webhook.async_unregister(handler.dm.hass, webhook_id)
+        del WebhookHandlerDecorator.webhook_id2handler[webhook_id]
+
+    async def start(self):
+        """Start the webhook handler."""
+        await super().start()
+        self._add_handler(self)
+
+        _LOGGER.debug("webhook handler %s listening on id %s", self.dm.name, self.webhook_id)
+
+    async def stop(self):
+        """Stop the webhook handler."""
+        await super().stop()
+        self._remove_handler(self)

@@ -3,12 +3,20 @@
 from ast import literal_eval
 import asyncio
 from datetime import datetime as dt
-from unittest.mock import mock_open, patch
+from http import HTTPStatus
+from unittest.mock import Mock, mock_open, patch
 
+from aiohttp import web
 import pytest
 
 from custom_components.pyscript import trigger
 from custom_components.pyscript.const import DOMAIN
+from custom_components.pyscript.decorator_abc import DispatchData
+from custom_components.pyscript.decorators.webhook import WebhookTriggerDecorator
+from custom_components.pyscript.decorators.webhook_handler import (
+    _RESPONSE_FUTURE_KEY,
+    WebhookHandlerDecorator,
+)
 from custom_components.pyscript.function import Function
 from homeassistant.components import webhook
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, EVENT_STATE_CHANGED
@@ -256,3 +264,298 @@ def webhook_test(payload, request):
     await webhook.async_handle_webhook(hass, "test_req_hook", request)
 
     assert literal_eval(await wait_until_done(notify_q)) == ["abc123", "POST", {"hello": "world"}]
+
+
+def _post_webhook_request(content: bytes = b"") -> MockRequest:
+    """Build a MockRequest representing a webhook POST with form data."""
+    return MockRequest(
+        content=content,
+        headers={},
+        method="POST",
+        query_string="",
+        mock_source="test",
+        remote="127.0.0.1",
+    )
+
+
+def test_webhook_handler_coerce_response_none():
+    """A None return should fall through to the HA default response."""
+    assert WebhookHandlerDecorator.coerce_response(None) is None
+
+
+def test_webhook_handler_coerce_response_int():
+    """Int returns should produce an aiohttp Response with that status."""
+    response = WebhookHandlerDecorator.coerce_response(HTTPStatus.CREATED.value)
+    assert isinstance(response, web.Response)
+    assert response.status == HTTPStatus.CREATED
+
+
+def test_webhook_handler_coerce_response_passthrough():
+    """An aiohttp Response should be returned unchanged."""
+    custom = web.Response(status=HTTPStatus.ACCEPTED, body=b"queued")
+    assert WebhookHandlerDecorator.coerce_response(custom) is custom
+
+
+def test_webhook_handler_coerce_response_bool_warns(caplog):
+    """Bool returns should be rejected so True/False don't masquerade as 1/0."""
+    assert WebhookHandlerDecorator.coerce_response(True) is None
+    assert "unsupported type bool" in caplog.text
+
+
+def test_webhook_handler_coerce_response_unsupported_warns(caplog):
+    """Other return types should warn and fall through."""
+    assert WebhookHandlerDecorator.coerce_response("ok") is None
+    assert "unsupported type str" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_webhook_handler_returns_status_code(hass):
+    """A webhook handler returning an int should set the HTTP status."""
+    await setup_script(
+        hass,
+        None,
+        dt(2020, 7, 1, 11, 59, 59, 999999),
+        """
+@webhook_handler("status_hook")
+def func_status(payload):
+    return 201
+""",
+    )
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+    response = await webhook.async_handle_webhook(hass, "status_hook", _post_webhook_request())
+    await hass.async_block_till_done()
+    assert response.status == HTTPStatus.CREATED
+
+
+@pytest.mark.asyncio
+async def test_webhook_handler_default_response(hass):
+    """A webhook handler returning None should produce a 200 OK."""
+    await setup_script(
+        hass,
+        None,
+        dt(2020, 7, 1, 11, 59, 59, 999999),
+        """
+@webhook_handler("default_hook")
+def func_default(payload):
+    pass
+""",
+    )
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+    response = await webhook.async_handle_webhook(hass, "default_hook", _post_webhook_request())
+    await hass.async_block_till_done()
+    assert response.status == HTTPStatus.OK
+
+
+@pytest.mark.asyncio
+async def test_webhook_handler_exception_returns_500(hass, caplog):
+    """A handler that raises should not hang and should return a 500."""
+    await setup_script(
+        hass,
+        None,
+        dt(2020, 7, 1, 11, 59, 59, 999999),
+        """
+@webhook_handler("boom_hook")
+def func_boom(payload):
+    raise ValueError("boom")
+""",
+    )
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+    response = await asyncio.wait_for(
+        webhook.async_handle_webhook(hass, "boom_hook", _post_webhook_request()), timeout=4
+    )
+    await hass.async_block_till_done()
+    assert response.status == HTTPStatus.INTERNAL_SERVER_ERROR
+    # The underlying exception is still surfaced to the user's log.
+    assert "boom" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_webhook_handler_exception_for_other_trigger_ignored():
+    """An exception whose trigger is a different decorator must not resolve this future."""
+    handler = Mock(spec=WebhookHandlerDecorator)
+    future = asyncio.get_running_loop().create_future()
+    data = DispatchData({}, trigger_context={_RESPONSE_FUTURE_KEY: future})
+    data.trigger = object()  # a different trigger instance, not `handler`
+    await WebhookHandlerDecorator.handle_call_exception(handler, data, ValueError("boom"))
+    assert not future.done()
+
+
+@pytest.mark.asyncio
+async def test_webhook_handler_str_expr_no_match(hass):
+    """When str_expr does not match, the function is not called and a 200 OK is sent."""
+    await setup_script(
+        hass,
+        None,
+        dt(2020, 7, 1, 11, 59, 59, 999999),
+        """
+@webhook_handler("expr_hook", "payload['ok'] == 'yes'")
+def func_expr(payload):
+    return 418
+""",
+    )
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+    response = await webhook.async_handle_webhook(hass, "expr_hook", _post_webhook_request(b"ok=no"))
+    await hass.async_block_till_done()
+    assert response.status == HTTPStatus.OK
+
+
+@pytest.mark.asyncio
+async def test_webhook_handler_str_expr_match(hass):
+    """When str_expr matches, the function is called and its return value drives the response."""
+    await setup_script(
+        hass,
+        None,
+        dt(2020, 7, 1, 11, 59, 59, 999999),
+        """
+@webhook_handler("expr_match_hook", "payload['ok'] == 'yes'")
+def func_expr(payload):
+    return 418
+""",
+    )
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+    response = await webhook.async_handle_webhook(hass, "expr_match_hook", _post_webhook_request(b"ok=yes"))
+    await hass.async_block_till_done()
+    assert response.status == 418  # the function returned 418 (HTTP "I'm a teapot")
+
+
+@pytest.mark.asyncio
+async def test_webhook_handler_json_payload(hass):
+    """A JSON request body is parsed into the payload passed to the handler."""
+    await setup_script(
+        hass,
+        None,
+        dt(2020, 7, 1, 11, 59, 59, 999999),
+        """
+@webhook_handler("json_hook")
+def func_json(payload):
+    return payload["status"]
+""",
+    )
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+    request = MockRequest(
+        content=b'{"status": 503}',
+        mock_source="test",
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        remote="127.0.0.1",
+    )
+    response = await webhook.async_handle_webhook(hass, "json_hook", request)
+    await hass.async_block_till_done()
+    assert response.status == HTTPStatus.SERVICE_UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_webhook_handler_concurrent_requests(hass):
+    """Concurrent requests to the same id must each get their own response (no shared future)."""
+    await setup_script(
+        hass,
+        None,
+        dt(2020, 7, 1, 11, 59, 59, 999999),
+        """
+@webhook_handler("concurrent_hook")
+def func_concurrent(payload):
+    task.sleep(float(payload["delay"]))
+    return int(payload["code"])
+""",
+    )
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+
+    # Request A starts first but sleeps longer, so it finishes after request B. Under the old
+    # shared-instance `self.future` design A would hang or receive B's response.
+    response_a, response_b = await asyncio.gather(
+        webhook.async_handle_webhook(hass, "concurrent_hook", _post_webhook_request(b"delay=0.3&code=201")),
+        webhook.async_handle_webhook(hass, "concurrent_hook", _post_webhook_request(b"delay=0.05&code=202")),
+    )
+    await hass.async_block_till_done()
+    assert response_a.status == HTTPStatus.CREATED
+    assert response_b.status == HTTPStatus.ACCEPTED
+
+
+def test_webhook_handler_duplicate_id_fails():
+    """A second @webhook_handler for the same webhook_id should be rejected at start."""
+    first = Mock(webhook_id="dup_hook", local_only=True, methods=None)
+    second = Mock(webhook_id="dup_hook", local_only=True, methods=None)
+
+    WebhookHandlerDecorator.webhook_id2handler.pop("dup_hook", None)
+    WebhookHandlerDecorator.webhook_id2handler["dup_hook"] = first
+    try:
+        with pytest.raises(ValueError, match="already has a @webhook_handler"):
+            WebhookHandlerDecorator._add_handler(second)  # pylint: disable=protected-access
+    finally:
+        WebhookHandlerDecorator.webhook_id2handler.pop("dup_hook", None)
+
+
+def test_webhook_handler_collides_with_webhook_trigger():
+    """A @webhook_handler whose id is already used by a @webhook_trigger should be rejected."""
+    trigger_mock = Mock(webhook_id="shared_hook")
+    handler = Mock(webhook_id="shared_hook", local_only=True, methods=None)
+
+    WebhookTriggerDecorator.webhook_id2triggers.pop("shared_hook", None)
+    WebhookTriggerDecorator.webhook_id2triggers["shared_hook"] = {trigger_mock}
+    try:
+        with pytest.raises(ValueError, match="already used by a @webhook_trigger"):
+            WebhookHandlerDecorator._add_handler(handler)  # pylint: disable=protected-access
+    finally:
+        WebhookTriggerDecorator.webhook_id2triggers.pop("shared_hook", None)
+
+
+def test_webhook_handler_remove_unregisters_and_frees_id():
+    """Removing a handler unregisters the webhook and frees the id for reuse."""
+    handler = Mock(webhook_id="remove_hook", local_only=True, methods=None)
+
+    WebhookHandlerDecorator.webhook_id2handler.pop("remove_hook", None)
+    with (
+        patch("custom_components.pyscript.decorators.webhook_handler.webhook.async_register") as register,
+        patch(
+            "custom_components.pyscript.decorators.webhook_handler.webhook.async_unregister"
+        ) as unregister,
+    ):
+        try:
+            WebhookHandlerDecorator._add_handler(handler)  # pylint: disable=protected-access
+            assert register.called
+            assert WebhookHandlerDecorator.webhook_id2handler["remove_hook"] is handler
+
+            WebhookHandlerDecorator._remove_handler(handler)  # pylint: disable=protected-access
+            assert unregister.called
+            assert "remove_hook" not in WebhookHandlerDecorator.webhook_id2handler
+        finally:
+            WebhookHandlerDecorator.webhook_id2handler.pop("remove_hook", None)
+
+
+@pytest.mark.asyncio
+async def test_webhook_handler_unknown_id_returns_none():
+    """The shared handler returns None for a webhook_id with no registered handler."""
+    WebhookHandlerDecorator.webhook_id2handler.pop("ghost_hook", None)
+    result = await WebhookHandlerDecorator._handler(  # pylint: disable=protected-access
+        Mock(), "ghost_hook", Mock()
+    )
+    assert result is None
+
+
+def test_webhook_handler_remove_is_noop_for_unregistered():
+    """Removing a handler that isn't the registered one must not unregister anything."""
+    handler = Mock(webhook_id="absent_hook")
+    WebhookHandlerDecorator.webhook_id2handler.pop("absent_hook", None)
+    with patch(
+        "custom_components.pyscript.decorators.webhook_handler.webhook.async_unregister"
+    ) as unregister:
+        WebhookHandlerDecorator._remove_handler(handler)  # pylint: disable=protected-access
+    assert not unregister.called
+
+
+@pytest.mark.asyncio
+async def test_webhook_handler_result_for_other_trigger_ignored():
+    """A result whose trigger is a different decorator must not resolve this handler's future."""
+    handler = Mock(spec=WebhookHandlerDecorator)
+    future = asyncio.get_running_loop().create_future()
+    data = DispatchData({}, trigger_context={_RESPONSE_FUTURE_KEY: future})
+    data.trigger = object()  # a different trigger instance, not `handler`
+    await WebhookHandlerDecorator.handle_call_result(handler, data, 201)
+    assert not future.done()
