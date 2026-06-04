@@ -12,7 +12,6 @@ from aiohttp import web
 from homeassistant.components import webhook
 
 from ..decorator_abc import CallResultHandlerDecorator, DispatchData
-from .webhook import WebhookTriggerDecorator
 from .webhook_base import WebhookBaseDecorator
 
 _LOGGER = logging.getLogger(__name__)
@@ -92,17 +91,10 @@ class WebhookHandlerDecorator(WebhookBaseDecorator, CallResultHandlerDecorator):
 
     @staticmethod
     def _add_handler(handler: WebhookHandlerDecorator) -> None:
+        # Home Assistant's webhook.async_register raises if the webhook_id is already
+        # registered (by another @webhook_handler, a @webhook_trigger, or any other
+        # integration), so duplicates are rejected here without an extra pyscript check.
         webhook_id = handler.webhook_id
-        if webhook_id in WebhookHandlerDecorator.webhook_id2handler:
-            raise ValueError(
-                f"webhook_id '{webhook_id}' already has a @webhook_handler; only one is allowed"
-            )
-        if webhook_id in WebhookTriggerDecorator.webhook_id2triggers:
-            raise ValueError(
-                f"webhook_id '{webhook_id}' is already used by a @webhook_trigger; "
-                f"a @webhook_handler must use a unique webhook_id"
-            )
-
         WebhookHandlerDecorator.register_webhook(handler, WebhookHandlerDecorator._handler)
         WebhookHandlerDecorator.webhook_id2handler[webhook_id] = handler
 

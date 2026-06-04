@@ -479,31 +479,35 @@ def func_concurrent(payload):
 
 
 def test_webhook_handler_duplicate_id_fails():
-    """A second @webhook_handler for the same webhook_id should be rejected at start."""
-    first = Mock(webhook_id="dup_hook", local_only=True, methods=None)
-    second = Mock(webhook_id="dup_hook", local_only=True, methods=None)
+    """A second @webhook_handler for the same webhook_id is rejected by HA's webhook registry."""
+    hass = Mock(data={})
+    first = Mock(webhook_id="dup_hook", local_only=True, methods=None, dm=Mock(hass=hass))
+    second = Mock(webhook_id="dup_hook", local_only=True, methods=None, dm=Mock(hass=hass))
 
     WebhookHandlerDecorator.webhook_id2handler.pop("dup_hook", None)
-    WebhookHandlerDecorator.webhook_id2handler["dup_hook"] = first
     try:
-        with pytest.raises(ValueError, match="already has a @webhook_handler"):
+        WebhookHandlerDecorator._add_handler(first)  # pylint: disable=protected-access
+        with pytest.raises(ValueError, match="Handler is already defined"):
             WebhookHandlerDecorator._add_handler(second)  # pylint: disable=protected-access
     finally:
         WebhookHandlerDecorator.webhook_id2handler.pop("dup_hook", None)
 
 
 def test_webhook_handler_collides_with_webhook_trigger():
-    """A @webhook_handler whose id is already used by a @webhook_trigger should be rejected."""
-    trigger_mock = Mock(webhook_id="shared_hook")
-    handler = Mock(webhook_id="shared_hook", local_only=True, methods=None)
+    """A @webhook_handler whose id is already used by a @webhook_trigger is rejected by HA."""
+    hass = Mock(data={})
+    trigger_mock = Mock(webhook_id="shared_hook", local_only=True, methods=None, dm=Mock(hass=hass))
+    handler = Mock(webhook_id="shared_hook", local_only=True, methods=None, dm=Mock(hass=hass))
 
     WebhookTriggerDecorator.webhook_id2triggers.pop("shared_hook", None)
-    WebhookTriggerDecorator.webhook_id2triggers["shared_hook"] = {trigger_mock}
+    WebhookHandlerDecorator.webhook_id2handler.pop("shared_hook", None)
     try:
-        with pytest.raises(ValueError, match="already used by a @webhook_trigger"):
+        WebhookTriggerDecorator._add_trigger(trigger_mock)  # pylint: disable=protected-access
+        with pytest.raises(ValueError, match="Handler is already defined"):
             WebhookHandlerDecorator._add_handler(handler)  # pylint: disable=protected-access
     finally:
         WebhookTriggerDecorator.webhook_id2triggers.pop("shared_hook", None)
+        WebhookHandlerDecorator.webhook_id2handler.pop("shared_hook", None)
 
 
 def test_webhook_handler_remove_unregisters_and_frees_id():
