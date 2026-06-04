@@ -931,11 +931,13 @@ The ``local_only``, ``methods``, ``str_expr`` and ``kwargs`` options, and the ``
 The return value is mapped to the response as follows:
 
 - ``None`` (or no ``return``) produces a ``200 OK``.
-- an ``int`` sends back a response with that status code, e.g. ``return 404``.
+- an ``int`` in the range ``100``-``599`` sends back a response with that status code, e.g. ``return 404``. An out-of-range int is ignored (a warning is logged) and a ``200 OK`` is sent.
 - an ``aiohttp.web.Response`` is returned as-is, giving full control over the status, body and headers. Constructing one requires ``from aiohttp import web``, which needs ``allow_all_imports: true`` in your pyscript configuration.
 - any other type is ignored (a warning is logged) and a ``200 OK`` is sent.
 
 If the function raises an unhandled exception, the exception is logged and a ``500 Internal Server Error`` is sent. Catch the exception in your function if you want to return a different status.
+
+If the request body cannot be parsed (for example a body declared as ``application/json`` that is not valid JSON), the function is not called and a ``400 Bad Request`` is sent.
 
 For example:
 

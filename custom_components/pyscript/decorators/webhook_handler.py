@@ -36,7 +36,14 @@ class WebhookHandlerDecorator(WebhookBaseDecorator, CallResultHandlerDecorator):
         if handler is None:
             return None
 
-        func_args = await WebhookHandlerDecorator.build_func_args(webhook_id, request)
+        try:
+            func_args = await WebhookHandlerDecorator.build_func_args(webhook_id, request)
+        except ValueError:
+            # The body could not be parsed (e.g. malformed JSON). Unlike @webhook_trigger,
+            # which silently drops the event, a handler should tell the caller their request
+            # was bad rather than returning a 200.
+            _LOGGER.debug("webhook %s received an unparseable request body", webhook_id)
+            return web.Response(status=HTTPStatus.BAD_REQUEST)
 
         if handler.has_expression():
             if not await handler.check_expression_vars(func_args):
@@ -81,7 +88,13 @@ class WebhookHandlerDecorator(WebhookBaseDecorator, CallResultHandlerDecorator):
             return value
         # bool is a subclass of int; reject it so True/False don't become 1/0 status codes.
         if isinstance(value, int) and not isinstance(value, bool):
-            return web.Response(status=value)
+            if 100 <= value <= 599:
+                return web.Response(status=value)
+            _LOGGER.warning(
+                "@webhook_handler function returned %s, which is not a valid HTTP status code (100-599)",
+                value,
+            )
+            return None
         _LOGGER.warning(
             "@webhook_handler function returned unsupported type %s; "
             "expected int status code or aiohttp.web.Response",

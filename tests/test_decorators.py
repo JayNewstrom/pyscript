@@ -80,7 +80,7 @@ async def wait_until_done(notify_q):
 
 
 @pytest.mark.asyncio
-async def test_decorator_errors(hass, caplog):
+async def test_decorator_errors(hass):
     """Test decorator syntax and run-time errors."""
     notify_q = asyncio.Queue(0)
     await setup_script(
@@ -476,6 +476,78 @@ def func_concurrent(payload):
     await hass.async_block_till_done()
     assert response_a.status == HTTPStatus.CREATED
     assert response_b.status == HTTPStatus.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_webhook_handler_cancelled_action_still_responds(hass):
+    """If @task_unique cancels an in-flight action, that request must get a 500, not hang."""
+    await setup_script(
+        hass,
+        None,
+        dt(2020, 7, 1, 11, 59, 59, 999999),
+        """
+@webhook_handler("cancel_hook")
+@task_unique("cancel_unique")
+def func_cancel(payload):
+    task.sleep(float(payload["delay"]))
+    return int(payload["code"])
+""",
+    )
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+
+    async def fire(delay, code):
+        return await asyncio.wait_for(
+            webhook.async_handle_webhook(
+                hass, "cancel_hook", _post_webhook_request(f"delay={delay}&code={code}".encode())
+            ),
+            timeout=4,
+        )
+
+    # Both requests register the same @task_unique name while sleeping, so whichever runs
+    # second cancels the other mid-flight. Before the fix the cancelled request's response
+    # future was orphaned and the request hung; now it resolves to a 500.
+    results = await asyncio.gather(fire(0.3, 201), fire(0.05, 202), return_exceptions=True)
+    await hass.async_block_till_done()
+
+    assert not any(isinstance(r, Exception) for r in results), f"a request hung/failed: {results}"
+    statuses = sorted(r.status for r in results)
+    assert statuses[0] in (HTTPStatus.CREATED, HTTPStatus.ACCEPTED), statuses  # survivor's own code
+    assert statuses[1] == HTTPStatus.INTERNAL_SERVER_ERROR, statuses  # cancelled request
+
+
+@pytest.mark.asyncio
+async def test_webhook_handler_malformed_json_returns_400(hass):
+    """A body that claims to be JSON but isn't should yield a 400, not a masked 200."""
+    await setup_script(
+        hass,
+        None,
+        dt(2020, 7, 1, 11, 59, 59, 999999),
+        """
+@webhook_handler("bad_json_hook")
+def func_bad_json(payload):
+    return 200
+""",
+    )
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+    request = MockRequest(
+        content=b"{not valid json",
+        mock_source="test",
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        remote="127.0.0.1",
+    )
+    response = await webhook.async_handle_webhook(hass, "bad_json_hook", request)
+    await hass.async_block_till_done()
+    assert response.status == HTTPStatus.BAD_REQUEST
+
+
+def test_webhook_handler_coerce_response_out_of_range_warns(caplog):
+    """An int outside the valid HTTP status range should warn and fall through to a 200."""
+    assert WebhookHandlerDecorator.coerce_response(1000) is None
+    assert WebhookHandlerDecorator.coerce_response(0) is None
+    assert "not a valid HTTP status code" in caplog.text
 
 
 def test_webhook_handler_duplicate_id_fails():

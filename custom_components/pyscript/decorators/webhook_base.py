@@ -35,7 +35,7 @@ class WebhookBaseDecorator(TriggerDecorator, ExpressionDecorator, AutoKwargsDeco
 
     webhook_id: str
     local_only: bool
-    methods: set[str]
+    methods: list[str] | None
 
     async def validate(self):
         """Validate the webhook configuration."""
