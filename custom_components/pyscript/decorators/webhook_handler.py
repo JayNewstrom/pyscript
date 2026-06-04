@@ -7,16 +7,13 @@ from http import HTTPStatus
 import logging
 from typing import Any, ClassVar
 
-from aiohttp import hdrs, web
-import voluptuous as vol
+from aiohttp import web
 
 from homeassistant.components import webhook
-from homeassistant.components.webhook import SUPPORTED_METHODS
-from homeassistant.helpers import config_validation as cv
 
-from ..decorator_abc import CallResultHandlerDecorator, DispatchData, TriggerDecorator
-from .base import AutoKwargsDecorator, ExpressionDecorator
+from ..decorator_abc import CallResultHandlerDecorator, DispatchData
 from .webhook import WebhookTriggerDecorator
+from .webhook_base import WebhookBaseDecorator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -26,39 +23,13 @@ _LOGGER = logging.getLogger(__name__)
 _RESPONSE_FUTURE_KEY = "webhook_response_future"
 
 
-class WebhookHandlerDecorator(
-    TriggerDecorator, ExpressionDecorator, AutoKwargsDecorator, CallResultHandlerDecorator
-):
+class WebhookHandlerDecorator(WebhookBaseDecorator, CallResultHandlerDecorator):
     """Implementation for @webhook_handler (one handler per id; return value drives the response)."""
 
     name = "webhook_handler"
-    args_schema = vol.Schema(
-        vol.All(
-            [vol.Coerce(str)],
-            vol.Length(min=1, max=2, msg="needs at least one argument"),
-        )
-    )
-    kwargs_schema = vol.Schema(
-        {
-            vol.Optional("local_only", default=True): cv.boolean,
-            vol.Optional("methods"): vol.All(list[str], [vol.In(SUPPORTED_METHODS)]),
-        }
-    )
-
-    webhook_id: str
-    local_only: bool
-    methods: set[str]
 
     # Exactly one handler per webhook_id (unlike webhook_trigger which allows many).
     webhook_id2handler: ClassVar[dict[str, WebhookHandlerDecorator]] = {}
-
-    async def validate(self):
-        """Validate the webhook handler configuration."""
-        await super().validate()
-        self.webhook_id = self.args[0]
-
-        if len(self.args) == 2:
-            self.create_expression(self.args[1])
 
     @staticmethod
     async def _handler(hass, webhook_id, request):
@@ -66,18 +37,7 @@ class WebhookHandlerDecorator(
         if handler is None:
             return None
 
-        func_args = {
-            "trigger_type": "webhook",
-            "webhook_id": webhook_id,
-            "request": request,
-        }
-
-        if "json" in request.headers.get(hdrs.CONTENT_TYPE, ""):
-            func_args["payload"] = await request.json()
-        else:
-            # Could potentially return multiples of a key - only take the first
-            payload_multidict = await request.post()
-            func_args["payload"] = {k: payload_multidict.getone(k) for k in payload_multidict.keys()}
+        func_args = await WebhookHandlerDecorator.build_func_args(webhook_id, request)
 
         if handler.has_expression():
             if not await handler.check_expression_vars(func_args):
@@ -143,15 +103,7 @@ class WebhookHandlerDecorator(
                 f"a @webhook_handler must use a unique webhook_id"
             )
 
-        webhook.async_register(
-            handler.dm.hass,
-            "pyscript",  # DOMAIN
-            "pyscript",  # NAME
-            webhook_id,
-            WebhookHandlerDecorator._handler,
-            local_only=handler.local_only,
-            allowed_methods=handler.methods,
-        )
+        WebhookHandlerDecorator.register_webhook(handler, WebhookHandlerDecorator._handler)
         WebhookHandlerDecorator.webhook_id2handler[webhook_id] = handler
 
     @staticmethod
