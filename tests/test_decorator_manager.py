@@ -651,7 +651,7 @@ async def test_function_decorator_manager_cancellation_notifies_result_handlers(
     # response future is resolved rather than orphaned)...
     assert result_handler.results == [None]
     # ...but a cancellation is not logged as an error the way a normal exception is.
-    assert ast_ctx.logged_exceptions == []
+    assert not ast_ctx.logged_exceptions
 
 
 def test_decorator_registry_register_requires_name():
